@@ -69,6 +69,9 @@ class Request:
 
         # How many times this request has been preempted.
         self.num_preemptions = 0
+        # P/D: prefilled elsewhere and queued at a decode instance that had no
+        # room for its KV. Its KV is complete; admission only claims the blocks.
+        self.awaiting_decode_admission = False
         # Prefix-cache stats are recorded once per request per tier.
         self._prefix_npu_stats_counted = False
         self._prefix_storage_stats_counted = False

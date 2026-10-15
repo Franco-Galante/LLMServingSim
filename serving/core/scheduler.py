@@ -133,6 +133,8 @@ class Scheduler:
         # in the prefix-caching modes it should stay near zero.
         self.recompute_tokens = 0
         self.num_preemptions = 0
+        # P/D decode instance: handoffs that had to wait for free KV blocks.
+        self.num_decode_deferred = 0
 
         self.memory = MemoryModel(model, instance_id, node_id, num_npus, tp_size, npu_mem, cpu_mem,
                                   block_size, fp, enable_prefix_caching, enable_prefix_sharing,
@@ -374,7 +376,13 @@ class Scheduler:
             req.num_computed_tokens = num_computed
             req.status = RequestStatus.RUNNING
             self.running.append(req)
-            self.memory.record_prefix_stats(req)
+            if req.awaiting_decode_admission:
+                # Its prompt was counted on the prefill instance, as for a
+                # handoff that add_decode admitted directly. It claimed no
+                # lower-tier blocks, so there is no recall traffic to drop.
+                req.awaiting_decode_admission = False
+            else:
+                self.memory.record_prefix_stats(req)
 
             scheduled.append((req, num_new, num_computed))
             token_budget -= num_new
@@ -753,22 +761,31 @@ class Scheduler:
         The KV transfer itself is already charged: the prefill instance's trace
         carries a per-layer send to the paired decode NPU. So this only claims
         the blocks -- reporting no load bytes, or the transfer would be billed
-        twice.
+        twice. When the blocks are not free the request waits in ``waiting``
+        and is admitted by phase B, counted in ``num_decode_deferred``.
         """
         req.instance_id = self.instance_id
-        req.status = RequestStatus.RUNNING
-        hit_blocks, num_npu_hit, num_lower_hit = self.kv.get_computed_blocks(req)
-        num_computed = req.num_computed_tokens
-        if self.kv.allocate_slots(req, 1, hit_blocks, num_npu_hit, num_lower_hit) is None:
-            raise RuntimeError(
-                f"[Scheduler] [node_id={self.node_id},inst={self.instance_id}] decode "
-                f"instance cannot admit request {req.id}: {req.num_tokens_reached} tokens "
-                f"need more blocks than the pool has free "
-                f"({self.kv.npu_pool.get_num_free_blocks()} of {self.kv.npu_pool.num_blocks})"
-            )
-        req.num_computed_tokens = num_computed
-        self.kv.take_traffic()          # a P/D handoff is not a recall
-        self.running.append(req)
+        # FCFS: once anything is queued here, later handoffs queue behind it.
+        if not self.waiting:
+            hit_blocks, num_npu_hit, num_lower_hit = self.kv.get_computed_blocks(req)
+            num_computed = req.num_computed_tokens
+            if self.kv.allocate_slots(req, 1, hit_blocks, num_npu_hit, num_lower_hit) is not None:
+                req.num_computed_tokens = num_computed
+                req.status = RequestStatus.RUNNING
+                self.kv.take_traffic()          # a P/D handoff is not a recall
+                self.running.append(req)
+                return
+        # No room for its KV. vLLM's decode side keeps such a request waiting
+        # until blocks free up rather than failing; phase B admits it, and since
+        # num_computed_tokens is already the full prompt it is scheduled as a
+        # one-token decode that claims blocks for the whole sequence.
+        req.status = RequestStatus.WAITING
+        req.awaiting_decode_admission = True
+        self.num_decode_deferred += 1
+        bisect.insort(self.waiting, req, key=lambda r: (r.arrival, r.id))
+        self.logger.info("Deferred P/D handoff of request #%d: decode KV full "
+                         "(%d of %d blocks free)", req.id,
+                         self.kv.npu_pool.get_num_free_blocks(), self.kv.npu_pool.num_blocks)
 
     def is_request_empty(self):
         return not self.waiting and not self.running and not self.inflight

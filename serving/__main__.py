@@ -1466,6 +1466,9 @@ def main():
         print_markup(f"Preemptions:                                                        {total_preempt}")
     if total_recompute:
         print_markup(f"Recomputed prompt tokens (preemption):                               {total_recompute}")
+    total_deferred = sum(s.num_decode_deferred for s in schedulers)
+    if total_deferred:
+        print_markup(f"Deferred P/D handoffs (decode KV full):                              {total_deferred}")
     print_markup(f"Total generated tokens:                                             {total_gen}")
     print_markup(f"Request throughput (req/s):                                         {req_cnt/total_latency:.2f}")
     print_markup(f"Average prompt throughput (tok/s):                                  {total_prompt/total_latency:.2f}")
