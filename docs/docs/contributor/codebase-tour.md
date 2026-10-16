@@ -45,6 +45,7 @@ serving/
     ├── router.py            Request routing across instances
     ├── gate_function.py     MoE expert routing (incl. group-limited)
     ├── spec_decode.py       Speculative-decoding acceptance model
+    ├── step_log.py          --step-log per-step batch records
     ├── cudagraph.py         Target graph padding and DP shape synchronization
     ├── config_builder.py    Cluster config -> ASTRA-Sim inputs
     ├── hardware_defaults.py Measured hardware defaults and override precedence

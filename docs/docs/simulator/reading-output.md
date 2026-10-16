@@ -92,6 +92,39 @@ df["ITL_list"] = df["ITL"].apply(ast.literal_eval)
 df["ITL_p50_ms"] = df["ITL_list"].apply(lambda xs: pd.Series(xs).quantile(0.5) / 1e6)
 ```
 
+## Step log
+
+`--step-log <path>.csv` writes one row per completed batch, i.e. per step of
+an instance. The per-request CSV says what each request experienced; the
+step log says what each GPU did, which is what utilization metrics need.
+
+| Column | Meaning |
+| --- | --- |
+| `instance`, `batch_id` | the instance and its batch |
+| `dummy` | 1 for a DP synchronisation dummy (no requests) |
+| `start_ns`, `end_ns` | clock when the batch was dispatched, and when the instance's last NPU finished it |
+| `npu_end_ns` | `npu:ns;...` per NPU: pipeline stages, and the decode NPU receiving a P/D prefill's KV |
+| `num_prefill`, `num_decode`, `sequences` | sequences with a prefill chunk, decode sequences, all sequences |
+| `prefill_tokens`, `decode_tokens` | real tokens in prefill chunks and in decode rows |
+| `forward_tokens` | rows the forward runs: real tokens plus CUDA-graph / DP padding |
+| `recompute_tokens` | tokens computed a second time because their request was preempted |
+| `attn_pairs` | causal query-key pairs, `sum(q*k + q*(q+1)/2)` over the step's sequences |
+| `kv_read_tokens` | KV positions the step's attention reads, `sum(k + q)` |
+| `kv_used_bytes` | KV bytes allocated on the instance at dispatch |
+| `gen_tokens` | output tokens the step produced |
+
+With TP the row covers all of an instance's NPUs, which run the step together.
+With `pp_size > 1`, `start_ns` to `end_ns` spans every pipeline stage, so it is
+not one GPU's busy time.
+
+Model FLOPs and bytes per step follow from the model config, for example
+`2 * P_blocks * tokens + 4 * L * q_dim * attn_pairs + 2 * hidden * vocab * sequences`
+FLOPs and `weights + kv_read_tokens * kv_bytes_per_token` bytes.
+
+`recompute_tokens` counts tokens actually recomputed. It can be smaller than
+`Recomputed prompt tokens`, which charges a resumed request its whole remaining
+work each time it is readmitted.
+
 ## Standard output (log levels)
 
 The simulator's `--log-level` flag controls how much detail lands on
@@ -291,6 +324,9 @@ Notes on individual fields:
 - **`Preemptions`** and **`Recomputed prompt tokens (preemption)`**
   lines appear only when non-zero. Their absence means the run never
   preempted.
+- **`Deferred P/D handoffs (decode KV full)`** appears only when non-zero:
+  prefilled requests that waited at the decode instance for free KV blocks
+  (see [Prefill/decode split](/docs/examples/disaggregated/prefill-decode-split)).
 - **`Throughput per N sec`** is the full per-interval series, the same
   numbers as the heartbeat lines, as a list of
   `(prompt, generation)` pairs.

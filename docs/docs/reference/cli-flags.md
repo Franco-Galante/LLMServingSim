@@ -121,6 +121,7 @@ MiniMax-M3's seven, +6.2% on Qwen3.8-27B.
 | `--dataset` | path | `None` | JSONL workload file. See **[Workloads → JSONL format](/docs/workloads/jsonl-format)** |
 | `--num-reqs` | int | `0` | Entries to load from the dataset (`0` = all). For agentic, each entry is a session |
 | `--output` | path | `None` | Per-request CSV output path. Stdout only if `None`. The literal `{run_id}` is replaced with the active run id |
+| `--step-log` | path | `None` | Per-step CSV: one row per completed batch with its start/end clock and its token, attention-pair and KV-read counts, for utilization metrics (MFU, MBU). Relative to the directory you run from. Written to `<path>.tmp` and renamed only on a normal end, so a crashed run leaves no complete-looking file. Supports `{run_id}`. See **[Reading the output → Step log](/docs/simulator/reading-output#step-log)** |
 
 ## Run isolation
 

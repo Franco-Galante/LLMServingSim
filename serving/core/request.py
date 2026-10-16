@@ -33,6 +33,10 @@ class Request:
         # re-derives its progress from the caches), so anything reading the
         # length off it would make a resumed request prefill to the wrong point.
         self.num_tokens_reached = input
+        # Furthest position this request has ever had computed. A step that
+        # computes below it is recomputing (after a preemption); only the step
+        # log reads it.
+        self.max_computed_tokens = 0
         self.status = RequestStatus.WAITING
         self.end_time = -1
         self.latency = -1
@@ -184,6 +188,11 @@ class Batch:
         # rewrites the request's own fields for the step it is building.
         self.scheduled_tokens = None
         self.spec_scheduled = {}
+        # Of ``total_len``, the tokens this step computes a second time because
+        # their request was preempted. Snapshotted at build time like the above.
+        self.recompute_tokens = 0
+        # Clock at which each NPU reported this batch done, for the step log.
+        self.npu_end = {}
     def log(self):
         print("-------------------------Batch Log------------------------")
         for key in self.__dict__.keys():

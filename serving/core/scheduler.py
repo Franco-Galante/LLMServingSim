@@ -135,6 +135,9 @@ class Scheduler:
         self.num_preemptions = 0
         # P/D decode instance: handoffs that had to wait for free KV blocks.
         self.num_decode_deferred = 0
+        # ``--step-log`` writer (a ``StepLog``), shared by every instance; None
+        # when the flag is off.
+        self.step_log = None
 
         self.memory = MemoryModel(model, instance_id, node_id, num_npus, tp_size, npu_mem, cpu_mem,
                                   block_size, fp, enable_prefix_caching, enable_prefix_sharing,
@@ -526,6 +529,7 @@ class Scheduler:
         scheduled_tokens = {}
         spec_scheduled = {}
         pd_kv_send_tokens = 0
+        recompute_tokens = 0
 
         for req, num_new, computed_before in scheduled:
             scheduled_tokens[req.id] = num_new
@@ -569,6 +573,11 @@ class Scheduler:
                 if computed_before == 0:
                     pd_kv_send_tokens += req.prefix_cache_hit
 
+            computed_after = computed_before + num_new
+            recompute_tokens += max(0, min(computed_after, req.max_computed_tokens)
+                                    - computed_before)
+            req.max_computed_tokens = max(req.max_computed_tokens, computed_after)
+
             # vLLM advances num_computed_tokens at schedule time
             # (_update_after_schedule), not at completion. With pp_size > 1 two
             # batches can be in flight, and advancing late would let the same
@@ -589,6 +598,7 @@ class Scheduler:
         batch.requests.extend(req for req, _, _ in scheduled)
         batch.scheduled_tokens = scheduled_tokens
         batch.spec_scheduled = spec_scheduled
+        batch.recompute_tokens = recompute_tokens
         # Written down to a victim tier off the critical path, so it carries no
         # latency -- but the bytes still cost DRAM energy.
         batch.write_through = write_through_bytes
@@ -627,6 +637,7 @@ class Scheduler:
             return prompt_t, gen_t, end_reqs
 
         batch.end.append(sys)
+        batch.npu_end[sys] = finish
         # A prefill instance also waits for its paired decode NPUs, which
         # receive the streamed KV.
         last_npu = self.num_npus * (2 if self.pd_type == "prefill" else 1) - 1
@@ -699,6 +710,8 @@ class Scheduler:
                 if n_draft:
                     accepted = self.spec.draw(n_draft)
                     req.num_computed_tokens -= (n_draft - accepted)
+                    # Rejected slots are recomputed with new tokens, not again.
+                    req.max_computed_tokens = req.num_computed_tokens
                     self.spec_drafted += n_draft
                     self.spec_accepted += accepted
                 req.num_spec_scheduled = 0
@@ -730,6 +743,8 @@ class Scheduler:
         # also the newest arrival the batch replacing it could have seen.
         self._last_batch_start = batch.batch_time
         self._last_batch_end = finish
+        if self.step_log is not None:
+            self.step_log.record(self.instance_id, batch, finish, gen_t)
 
         del self.inflight[idx]
         return prompt_t, gen_t, end_reqs

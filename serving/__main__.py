@@ -32,6 +32,7 @@ from serving.core.router import *
 from serving.core.power_model import *
 from serving.core.logger import *
 from serving.core.run_paths import build_run_paths, resolve_run_id
+from serving.core.step_log import StepLog
 import sys as flush
 
 from pyinstrument import Profiler
@@ -577,6 +578,10 @@ def main():
     parser.add_argument('--output', type=str, default=None,
                         help='path for per-request CSV output with latency metrics (TTFT, TPOT, ITL). '
                         'If None, results are printed to stdout only. Supports {run_id} placeholder')
+    parser.add_argument('--step-log', type=str, default=None,
+                        help='path for a per-step CSV: one row per completed batch with its start/end clock and '
+                        'token, attention and KV-read counts (for utilization metrics). Written to <path>.tmp and '
+                        'renamed on a normal end. Supports {run_id} placeholder')
     parser.add_argument('--run-id', type=str, default=None,
                         help='unique id for this simulation run. Intermediate ASTRA-Sim inputs are written under '
                         'astra-sim/inputs/runs/<run-id>. If omitted, a process-unique id is generated')
@@ -622,6 +627,10 @@ def main():
     run_paths = build_run_paths(astra_sim, args.run_id, args.inputs_root)
     args.inputs_root = run_paths.inputs_root
     args.output = _resolve_output_file(args.output, args.run_id)
+    # Relative to where the user stands, like --gate-stats (cwd is pre-chdir).
+    args.step_log = _resolve_output_file(args.step_log, args.run_id)
+    if args.step_log and not os.path.isabs(args.step_log):
+        args.step_log = os.path.join(cwd, args.step_log)
 
     configure_logger(level=args.log_level)
     logger = get_logger("Main")
@@ -790,6 +799,10 @@ def main():
             acceptance_model=_build_acceptance_model(
                 instance["model_name"], inst_cfg, instance["node_id"], instance_id),
         ))
+
+    step_log = StepLog(args.step_log) if args.step_log else None
+    for scheduler in schedulers:
+        scheduler.step_log = step_log
 
     # The derived KV capacity, not the utilization fraction, is what decides
     # memory pressure. It is per instance and only known once the schedulers
@@ -1514,6 +1527,9 @@ def main():
         print(f"Saving each request's information to output file: {output_file}")
         for i in range(num_instances):
             schedulers[i].save_output(output_file, is_append=False if i == 0 else True)
+    if step_log is not None:
+        step_log.close()
+        print(f"Saved the per-step log to: {step_log.path}")
 
     # --save-trace-text writes the text into the run directory, so keeping it
     # is implied: producing the text and then deleting it would be pointless.

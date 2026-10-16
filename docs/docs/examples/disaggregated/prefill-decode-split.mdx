@@ -109,6 +109,11 @@ being prefilled.
   is "in flight" only; decode instance accumulates KV blocks for
   every active request. With a long-running workload the decode
   instance is usually the memory bottleneck.
+- **A full decode instance queues handoffs.** A prefilled request whose
+  KV does not fit on the decode instance waits there, first come first
+  served, until blocks free up, as vLLM's decode side does. The wait shows
+  as a longer gap between the first token (made by the prefill instance)
+  and the second, and the run reports `Deferred P/D handoffs`.
 - **Production parallel.** This pattern is what
   [DistServe](https://arxiv.org/abs/2401.09670) and Mooncake
   popularized. Tuning the prefill:decode replica ratio is the main

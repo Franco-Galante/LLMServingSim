@@ -3,6 +3,21 @@
 All notable changes to this project are documented in this file.
 This project follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) conventions.
 
+## [Unreleased]
+
+### Added
+
+- `--step-log` writes one CSV row per completed batch (dispatch and end clock,
+  token, attention-pair and KV-read counts), for per-GPU utilization metrics
+  such as MFU and MBU. Off by default. See
+  [Reading the output](https://llmservingsim.ai/docs/simulator/reading-output#step-log).
+
+### Fixed
+
+- A P/D run no longer aborts with `decode instance cannot admit request` when
+  the decode instance's KV cache is full: the handoff waits for free blocks,
+  first come first served, and the run reports `Deferred P/D handoffs`.
+
 ## [v1.2.0] - 2026-10-06
 
 Version 1.2.0 expands serving simulation, profiling and validation across dense,

@@ -29,6 +29,7 @@ serving/                        Python package
 │   ├── block_pool.py           per-tier KV block pool + prefix-cache index
 │   ├── kv_cache_manager.py     tiered KV cache manager (block hashing, allocation)
 │   ├── run_paths.py            per-run ASTRA-Sim input/output path layout
+│   ├── step_log.py             --step-log per-step batch records
 │   ├── logger.py               Rich-based logger + stdio capture
 │   └── utils.py                model config loading, formatting helpers
 ├── run.sh                      one runnable example per feature (a menu, not a suite)
@@ -56,7 +57,7 @@ from one list is visible against the other.
 | **offloading** | `--enable-attn-offloading`, `--enable-sub-batch-interleaving`, `--enable-local-offloading` |
 | **trace / graph** | `--enable-block-copy`; run-wide: `--save-trace-text`, `--keep-inputs` |
 | **backend** *(run-wide)* | `--network-backend` |
-| **output** *(run-wide)* | `--output`, `--run-id`, `--inputs-root`, `--log-interval`, `--log-level` |
+| **output** *(run-wide)* | `--output`, `--step-log`, `--run-id`, `--inputs-root`, `--log-interval`, `--log-level` |
 
 The reversible switches also accept `--no-enable-block-copy`,
 `--no-enable-prefix-caching`, `--no-enable-chunked-prefill`,
@@ -414,6 +415,14 @@ id becomes a process-unique one, so two simulator invocations running at once
 do not share intermediate files; an explicit one is validated as a safe path
 component. `RunPaths` then carries the network / system / memory config paths
 that `config_builder.py` writes and `controller.py` hands to ASTRA-Sim.
+
+### `step_log.py`
+
+Writes `--step-log`: one CSV row per completed batch, recorded by
+`Scheduler.add_done` from the `Batch` it finishes (dispatch and end clock,
+token, attention-pair and KV-read counts, recompute tokens). The file goes to
+`<path>.tmp` and is renamed on a normal end only. Column reference:
+[Reading the output → Step log](https://llmservingsim.ai/docs/simulator/reading-output#step-log).
 
 ### `config_builder.py`
 
