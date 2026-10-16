@@ -63,11 +63,14 @@ run_one() {
     local model=$1 system=$2 rate=$3
     local base="$OUT/$model/${system}_rate${rate}"
     local start=$SECONDS reason=""
-    rm -f "$base.failed"
+    rm -f "$base.failed" "$base.steps.csv" "$base.steps.csv.tmp"
+    # --step-log: one row per GPU step, for MFU/MBU in gpu_report.py. Each run
+    # has its own file, and the simulator writes it to .tmp and renames it only
+    # on a normal end, so parallel runs never share or half-write one.
     python -m serving --cluster-config "$EXP/configs/$model/$system.json" \
         --block-size 16 --no-enable-prefix-caching \
         --dataset "$EXP/workloads/$model/rate${rate}.jsonl" \
-        --output "$base.csv" > "$base.log" 2>&1 &
+        --output "$base.csv" --step-log "$base.steps.csv" > "$base.log" 2>&1 &
     local py=$!
     # Watchdog: stop the run once its ASTRA-Sim has been dead on 3 checks in a
     # row (>10 s). A normal finish also passes through "ASTRA-Sim gone, simulator
@@ -98,7 +101,7 @@ run_one() {
             $(( (SECONDS - start) / 60 ))
     else
         [[ -z "$reason" ]] && reason="$(grep -E 'Error|error' "$base.log" | tail -n 1 | cut -c1-100)"
-        rm -f "$base.csv"
+        rm -f "$base.csv" "$base.steps.csv" "$base.steps.csv.tmp"
         echo "$reason" > "$base.failed"
         printf '%-8s %-11s rate=%-4s FAILED: %s\n' "$model" "$system" "$rate" "$reason"
     fi
@@ -151,7 +154,7 @@ done
 wait
 
 echo
-ok=$(ls "$OUT"/*/*.csv 2>/dev/null | wc -l)
+ok=$(ls "$OUT"/*/*_rate*[0-9].csv 2>/dev/null | wc -l)
 failed=$(ls "$OUT"/*/*.failed 2>/dev/null | wc -l)
 echo "done in $((SECONDS / 60)) min: $ok runs ok, $failed failed"
 python3 "$EXP/plot.py" "$OUT"

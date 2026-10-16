@@ -18,15 +18,15 @@ Writes to <dir>/:
     plots/<model>_gpus_vs_rate.png       per-GPU wait / running / waiting / memory vs rate
     plots/gpu_timelines/<model>_rate<R>.png   running, waiting, memory over time per GPU
 
-P/D (disaggregated) runs only, see assets/compute_and_memory.md:
-    MFU of the prefill GPU and MBU of the decode GPU, per second and per run
-    (mfu_* / mbu_* columns), plus
-    plots/<model>_mfu_mbu_vs_rate.png         mean and peak 1-s MFU / MBU vs rate
-    plots/mfu_mbu_timelines/<model>_rate<R>.png   MFU / MBU over time
-Colocated runs get no MFU/MBU: their GPUs mix prefill and decode, and the
-outputs cannot tell which tokens ran on which GPU.
+Compute and memory-bandwidth use, every GPU, see assets/compute_and_memory.md:
+    busy %, mean step time, MFU and MBU (busy and wall), from the run's step log
+    (<run>.steps.csv, written by --step-log), plus
+    plots/<model>_mfu_mbu_vs_rate.png             MFU / MBU vs rate
+    plots/mfu_mbu_timelines/<model>_rate<R>.png   per-second MFU / MBU per GPU
+A run without a step log falls back to a reconstruction from the per-second log
+and the per-request CSV, which works for P/D runs only (prefill GPU MFU, decode
+GPU MBU); a warning names those runs.
 
-Not available without a per-step log: GPU busy %, step times, batch sizes.
 Run-level counters (preemptions, deferred handoffs) are in summary.csv; in P/D
 the prefill GPU's memory never fills, so its evictions all happen on the decode GPU.
 """
@@ -58,11 +58,12 @@ MEM_UTIL_PCT = 90.0   # usable share of GPU memory (npu_mem.mem_util default)
 PEAK_TFLOPS = 500.0
 BYTES = 2             # bf16 weights and KV cache
 MIB = 1024 * 1024     # the log's "MB" are MiB
-PD_ONLY_WARNING = (
-    "WARNING: MFU and MBU are computed only for the disaggregated (P/D) runs. "
-    "In a colocated run each GPU runs prefill and decode together, and the "
-    "simulator outputs do not say which tokens ran on which GPU, so colocated "
-    "runs get no MFU/MBU. See experiments/pd_ttft/assets/compute_and_memory.md.")
+FALLBACK_WARNING = (
+    "WARNING: {n} run(s) have no step log (<run>.steps.csv): their MFU/MBU are "
+    "reconstructed from the per-second log, which works only for the "
+    "disaggregated (P/D) runs (prefill GPU MFU, decode GPU MBU) and is less "
+    "accurate. Colocated runs without a step log get none. Rerun them with "
+    "run.sh to get step logs. See experiments/pd_ttft/assets/compute_and_memory.md.")
 
 # (system, instance) -> label, color, marker. Colocated GPUs are symmetric
 # (load-balanced), so vs-rate panels show their average as one series.
@@ -82,6 +83,10 @@ LOG_TICK = re.compile(r"^\[([\d.]+)s\] Avg prompt throughput: ([\d.]+) tokens/s,
                       r"Avg generation throughput: ([\d.]+) tokens/s")
 LOG_INST = re.compile(r"Running Instance\[(\d+)\]: (\d+) reqs, Waiting: (\d+) reqs"
                       r".*Memory Usage ([\d.]+) MB \(([\d.]+) % Used\)")
+
+
+UTIL_KEYS = ("busy_pct", "step_ms_mean", "mfu_busy_pct", "mfu_wall_pct",
+             "mbu_busy_pct", "mbu_wall_pct")
 
 
 def mean(v):
@@ -131,8 +136,17 @@ def model_shape(model_key):
         hw_yaml = os.path.join(REPO, "profiler", "perf", inst["hardware"], "hardware.yaml")
         with open(hw_yaml) as f:
             mem_bw = yaml.safe_load(f)["defaults"]["npu_mem"]["mem_bw"]["value"]
+    # Every weight the GPU holds (and every step reads): blocks, norms, embedding,
+    # lm_head. Matches the simulator's own weight figure (15316.5 MiB for
+    # Llama-3.1-8B, 62488.8 MiB for Qwen3-32B).
+    norms = L * 2 * h + h + (L * 2 * head_dim if c["model_type"].startswith("qwen3") else 0)
+    embed = h * c["vocab_size"]
+    lm_head = 0 if c.get("tie_word_embeddings") else embed
     return {"layers": L, "q_dim": q_dim, "block_params": block_params,
-            "lm_head_params": h * c["vocab_size"], "peak_bw": mem_bw * 1e9}
+            "lm_head_params": h * c["vocab_size"], "peak_bw": mem_bw * 1e9,
+            "tp": inst["tp_size"],
+            "weight_bytes": (block_params + norms + embed + lm_head) * BYTES,
+            "kv_bytes_per_token": 2 * L * kv_dim * BYTES}
 
 
 def prefill_flops(n, shape):
@@ -141,6 +155,60 @@ def prefill_flops(n, shape):
     attention = 2 * shape["layers"] * shape["q_dim"] * n * n  # QK^T + AV, causal half
     lm_head = 2 * shape["lm_head_params"]                  # last token only
     return linear + attention + lm_head
+
+
+def step_utilization(path, shape):
+    """Per-GPU MFU / MBU from a step log (one row per completed batch).
+
+    Per step: FLOPs = 2*P_blocks*tokens + 4*L*q_dim*attn_pairs + 2*h*V*sequences
+              bytes = weights + kv_read_tokens * KV bytes/token
+    Divided per GPU by the TP degree. Run values: busy = sum / (sum of step
+    times x peak), wall = sum / (first start to last end x peak). The per-second
+    series spreads each step's work over its own interval.
+    """
+    peak_f = PEAK_TFLOPS * 1e12 * shape["tp"]
+    peak_b = shape["peak_bw"] * shape["tp"]
+    per = {}
+    with open(path) as f:
+        for r in csv.DictReader(f):
+            per.setdefault(int(r["instance"]), []).append(r)
+    out = {}
+    for inst, steps in per.items():
+        bins_f, bins_b = {}, {}
+        tot_f = tot_b = busy = 0.0
+        t0 = min(int(r["start_ns"]) for r in steps) / 1e9
+        t1 = max(int(r["end_ns"]) for r in steps) / 1e9
+        for r in steps:
+            s, e = int(r["start_ns"]) / 1e9, int(r["end_ns"]) / 1e9
+            tokens = int(r["prefill_tokens"]) + int(r["decode_tokens"])
+            flops = 0.0 if r["dummy"] == "1" else (
+                2 * shape["block_params"] * tokens
+                + 4 * shape["layers"] * shape["q_dim"] * int(r["attn_pairs"])
+                + 2 * shape["lm_head_params"] * int(r["sequences"]))
+            nbytes = shape["weight_bytes"] + int(r["kv_read_tokens"]) * shape["kv_bytes_per_token"]
+            tot_f += flops
+            tot_b += nbytes
+            busy += e - s
+            k = int(s) + 1                         # second k covers (k-1, k]
+            while k - 1 < e or k == int(s) + 1:
+                share = (min(e, k) - max(s, k - 1)) / (e - s) if e > s else 1.0
+                if share > 0:
+                    bins_f[k] = bins_f.get(k, 0.0) + flops * share
+                    bins_b[k] = bins_b.get(k, 0.0) + nbytes * share
+                k += 1
+        t = list(range(1, max(bins_f) + 1))
+        out[inst] = {
+            "t": t,
+            "mfu": [100 * bins_f.get(k, 0.0) / peak_f for k in t],
+            "mbu": [100 * bins_b.get(k, 0.0) / peak_b for k in t],
+            "busy_pct": 100 * busy / (t1 - t0),
+            "step_ms_mean": 1e3 * busy / len(steps),
+            "mfu_busy_pct": 100 * tot_f / (busy * peak_f),
+            "mfu_wall_pct": 100 * tot_f / ((t1 - t0) * peak_f),
+            "mbu_busy_pct": 100 * tot_b / (busy * peak_b),
+            "mbu_wall_pct": 100 * tot_b / ((t1 - t0) * peak_b),
+        }
+    return out
 
 
 def pd_utilization(rows, log, shape):
@@ -195,8 +263,11 @@ def pd_utilization(rows, log, shape):
             mbu.append(100 * steps_per_s * (weights + kv) / shape["peak_bw"])
     busy = [i for i, n in enumerate(dec["running"]) if n] if dec else []
     mbu_busy = mbu[busy[0]:busy[-1] + 1] if busy else []
-    return {"mfu_t": mfu_t, "mfu": mfu, "mbu_t": mbu_t, "mbu": mbu,
-            "mfu_mean_pct": mfu_mean, "mbu_mean_pct": mean(mbu_busy)}
+    # Same shape as step_utilization: the prefill GPU has only MFU (its run
+    # value is over its busy span, like "wall"), the decode GPU only MBU (mean
+    # over the seconds it had requests running, closest to "busy").
+    return {0: {"t": mfu_t, "mfu": mfu, "mbu": None, "mfu_wall_pct": mfu_mean},
+            1: {"t": mbu_t, "mfu": None, "mbu": mbu, "mbu_busy_pct": mean(mbu_busy)}}
 
 
 def gpu_rows(model, system, rate, base, shape):
@@ -236,13 +307,18 @@ def gpu_rows(model, system, rate, base, shape):
             "running_mean": mean(s["running"]), "running_max": max(s["running"], default=""),
             "waiting_mean": mean(s["waiting"]), "waiting_max": max(s["waiting"], default=""),
             "mem_mean_pct": mean(s["mem"]), "mem_max_pct": max(s["mem"], default=""),
-            "mfu_mean_pct": "", "mbu_mean_pct": "",
         })
-    util = None
-    if system == "pd_custom":
-        util = pd_utilization(rows, log, shape)
-        out[0]["mfu_mean_pct"] = util["mfu_mean_pct"]   # prefill GPU
-        out[1]["mbu_mean_pct"] = util["mbu_mean_pct"]   # decode GPU
+    if os.path.exists(base + ".steps.csv"):
+        util, source = step_utilization(base + ".steps.csv", shape), "step_log"
+    elif system == "pd_custom":
+        util, source = pd_utilization(rows, log, shape), "reconstructed"
+    else:
+        util, source = None, ""
+    for inst, row in enumerate(out):
+        u = (util or {}).get(inst, {})
+        for key in UTIL_KEYS:
+            row[key] = u.get(key, "")
+        row["util_source"] = source if u else ""
     return out, log, util
 
 
@@ -260,10 +336,11 @@ def write_reports(rows, out_dir):
     with open(os.path.join(out_dir, "gpu_report.txt"), "w") as f:
         hdr = (f"{'model':<8}{'system':<11}{'rate':>5} {'GPU':<17}{'wait mean':>10}{'p99':>9}"
                f"{'TTFT':>8}{'tok gap':>9}{'running':>9}{'waiting':>9}{'mem %':>7}"
-               f"{'MFU %':>7}{'MBU %':>7}")
+               f"{'busy %':>8}{'step ms':>9}{'MFU b/w %':>13}{'MBU b/w %':>13}")
         f.write("wait/TTFT in s, token gap in ms; running/waiting/mem are means of "
-                "per-second samples; MFU (prefill GPU) / MBU (decode GPU) are run means,\n"
-                "P/D only (see assets/compute_and_memory.md)\n"
+                "per-second samples.\nbusy %, step ms, MFU/MBU from the step log: b = over "
+                "the GPU's step time, w = over the run span (see assets/compute_and_memory.md);\n"
+                "'*' = reconstructed without a step log (P/D only, less accurate)\n"
                 + hdr + "\n" + "-" * len(hdr) + "\n")
         for r in rows:
             gpu = f"{r['gpu']} {r['role']}"
@@ -272,7 +349,17 @@ def write_reports(rows, out_dir):
                     f"{fmt(r['ttft_mean_s']):>8}{fmt(r['token_gap_mean_ms'], 1):>9}"
                     f"{fmt(r['running_mean'], 1):>9}{fmt(r['waiting_mean'], 1):>9}"
                     f"{fmt(r['mem_mean_pct'], 1):>7}"
-                    f"{fmt(r['mfu_mean_pct'], 1):>7}{fmt(r['mbu_mean_pct'], 1):>7}\n")
+                    f"{fmt(r['busy_pct'], 1):>8}{fmt(r['step_ms_mean'], 1):>9}"
+                    f"{pair(r, 'mfu'):>13}{pair(r, 'mbu'):>13}\n")
+
+
+def pair(r, key):
+    """'busy/wall' for the text report; '*' marks a reconstructed value."""
+    b, w = r[f"{key}_busy_pct"], r[f"{key}_wall_pct"]
+    if b == "" and w == "":
+        return ""
+    mark = "*" if r["util_source"] == "reconstructed" else ""
+    return f"{fmt(b, 1) if b != '' else '-'}/{fmt(w, 1) if w != '' else '-'}{mark}"
 
 
 def legend_top(fig, handles):
@@ -356,54 +443,77 @@ def plot_timeline(model, rate, logs, out_path):
 
 
 def plot_util_vs_rate(model, rows, out_path):
-    """P/D only: prefill GPU MFU and decode GPU MBU vs rate (run means)."""
-    panels = [(0, "mfu", "Prefill GPU: MFU (% of peak FLOP/s)", "#eb6834"),
-              (1, "mbu", "Decode GPU: MBU (% of peak bandwidth)", "#1baf7a")]
-    fig, axes = plt.subplots(1, 2, figsize=(10, 4.2), facecolor=SURFACE)
-    for ax, (gpu, key, title, color) in zip(axes, panels):
+    """MFU and MBU vs rate per GPU role: solid = busy (over step time),
+    dashed = wall (over the run span)."""
+    fig, axes = plt.subplots(1, 2, figsize=(11, 4.4), facecolor=SURFACE)
+    for ax, key, title in zip(axes, ("mfu", "mbu"),
+                              ("MFU (% of peak bf16 FLOP/s)", "MBU (% of peak memory bandwidth)")):
         style(ax)
-        pts = sorted((float(r["rate"]), r[f"{key}_mean_pct"])
-                     for r in rows if r["model"] == model and r["system"] == "pd_custom"
-                     and r["gpu"] == gpu)
-        if pts:
-            xs, means = zip(*pts)
-            ax.plot(xs, means, color=color, marker="o", markersize=6, linewidth=2)
+        for system, inst, label, color, marker in RATE_SERIES:
+            for kind, ls in (("busy", "-"), ("wall", "--")):
+                pts = {}
+                for r in rows:
+                    if r["model"] != model or r["system"] != system:
+                        continue
+                    if inst is not None and r["gpu"] != inst:
+                        continue
+                    v = r[f"{key}_{kind}_pct"]
+                    if v != "":
+                        pts.setdefault(float(r["rate"]), []).append(v)
+                if pts:
+                    xs = sorted(pts)
+                    ax.plot(xs, [mean(pts[x]) for x in xs], color=color, marker=marker,
+                            markersize=5 if ls == "-" else 0, linewidth=2 if ls == "-" else 1.3,
+                            linestyle=ls, alpha=1 if ls == "-" else 0.8)
         ax.set_ylim(0, 100)
         ax.set_xlabel("request rate (req/s)", fontsize=9, color=INK_2)
         ax.set_title(title, fontsize=10, color=INK, loc="left")
-    fig.suptitle(f"{MODEL_TITLES.get(model, model)}, P/D on RTXPRO6000: compute and "
-                 f"memory-bandwidth use vs request rate",
+    fig.suptitle(f"{MODEL_TITLES.get(model, model)} on RTXPRO6000: compute and "
+                 f"memory-bandwidth use per GPU vs request rate",
                  fontsize=12, color=INK, y=1 - 0.08 / fig.get_figheight())
-    fig.text(0.5, 1 - 0.5 / fig.get_figheight(), "mean over each GPU's busy span",
-             ha="center", fontsize=9, color=INK_2)
+    legend_top(fig, [plt.Line2D([], [], color=c, marker=mk, linestyle="", markersize=7, label=l)
+                     for _, _, l, c, mk in RATE_SERIES]
+               + [plt.Line2D([], [], color=INK_2, linewidth=2, label="busy (step time)"),
+                  plt.Line2D([], [], color=INK_2, linewidth=1.3, linestyle="--",
+                             label="wall (run span)")])
     fig.tight_layout(rect=(0, 0, 1, 1 - 0.65 / fig.get_figheight()))
     fig.savefig(out_path, dpi=150, facecolor=SURFACE)
     plt.close(fig)
 
 
-def plot_util_timeline(model, rate, util, out_path):
-    """P/D only: prefill GPU MFU and decode GPU MBU per second."""
-    fig, axes = plt.subplots(2, 1, figsize=(10, 6), sharex=True, facecolor=SURFACE)
-    for ax, (t, y, title, color) in zip(axes, [
-            (util["mfu_t"], util["mfu"], "Prefill GPU: MFU (% of peak FLOP/s)", "#eb6834"),
-            (util["mbu_t"], util["mbu"], "Decode GPU: MBU (% of peak bandwidth)", "#1baf7a")]):
-        style(ax)
-        ax.plot(t, y, color=color, linewidth=1.4)
-        ax.axhline(100, color=INK_2, linewidth=1, linestyle=":", zorder=0)
-        ax.set_ylim(bottom=0)
-        ax.set_title(title, fontsize=10, color=INK, loc="left")
-    axes[-1].set_xlabel("simulated time (s)", fontsize=9, color=INK_2)
-    fig.suptitle(f"{MODEL_TITLES.get(model, model)}, P/D at {rate:g} req/s: "
-                 f"per-second MFU and MBU", fontsize=12, color=INK,
-                 y=1 - 0.08 / fig.get_figheight())
-    fig.tight_layout(rect=(0, 0, 1, 1 - 0.4 / fig.get_figheight()))
+def plot_util_timeline(model, rate, by_system, out_path):
+    """Columns: colocated, P/D. Rows: MFU, MBU per second. One line per GPU."""
+    systems = [s for s in ("colocated", "pd_custom") if by_system.get(s)]
+    fig, axes = plt.subplots(2, len(systems), figsize=(6.5 * len(systems), 6.2),
+                             sharex="col", squeeze=False, facecolor=SURFACE)
+    for col, system in enumerate(systems):
+        for row, (key, title) in enumerate((("mfu", "MFU (% of peak FLOP/s)"),
+                                           ("mbu", "MBU (% of peak bandwidth)"))):
+            ax = axes[row, col]
+            style(ax)
+            for inst in (0, 1):
+                u = by_system[system].get(inst)
+                if not u or u.get(key) is None:
+                    continue
+                label, color, _ = GPUS[(system, inst)]
+                ax.plot(u["t"], u[key], color=color, linewidth=1.2, label=label)
+            ax.axhline(100, color=INK_2, linewidth=1, linestyle=":", zorder=0)
+            ax.set_ylim(bottom=0)
+            name = "Colocated" if system == "colocated" else "P/D"
+            ax.set_title(f"{name}: {title}", fontsize=10, color=INK, loc="left")
+            if row == 1:
+                ax.set_xlabel("simulated time (s)", fontsize=9, color=INK_2)
+    fig.suptitle(f"{MODEL_TITLES.get(model, model)} at {rate:g} req/s: per-second MFU and "
+                 f"MBU per GPU", fontsize=12, color=INK, y=1 - 0.08 / fig.get_figheight())
+    legend_top(fig, [plt.Line2D([], [], color=c, linewidth=2, label=l)
+                     for (sysname, _), (l, c, _) in GPUS.items() if sysname in systems])
+    fig.tight_layout(rect=(0, 0, 1, 1 - 0.65 / fig.get_figheight()))
     fig.savefig(out_path, dpi=130, facecolor=SURFACE)
     plt.close(fig)
 
 
 def main():
     out_dir = sys.argv[1] if len(sys.argv) > 1 else "outputs/pd_ttft_long"
-    print(PD_ONLY_WARNING, file=sys.stderr)
     rows, logs, utils, shapes = [], {}, {}, {}
     for path in sorted(glob.glob(os.path.join(out_dir, "*", "*_rate*.csv"))):
         model = os.path.basename(os.path.dirname(path))
@@ -417,10 +527,14 @@ def main():
         rows += r
         logs.setdefault(model, {}).setdefault(rate, {})[system] = log
         if util:
-            utils.setdefault(model, {})[rate] = util
+            utils.setdefault(model, {}).setdefault(rate, {})[system] = util
     if not rows:
         print(f"no finished runs under {out_dir}")
         return
+    fallback = {(r["model"], r["system"], r["rate"]) for r in rows
+                if r["util_source"] != "step_log"}
+    if fallback:
+        print(FALLBACK_WARNING.format(n=len(fallback)), file=sys.stderr)
     rows.sort(key=lambda r: (r["model"], float(r["rate"]), r["system"], r["gpu"]))
     write_reports(rows, out_dir)
 
@@ -436,12 +550,12 @@ def main():
     os.makedirs(util_dir, exist_ok=True)
     for model in sorted(utils):
         plot_util_vs_rate(model, rows, os.path.join(plot_dir, f"{model}_mfu_mbu_vs_rate.png"))
-        for rate, util in sorted(utils[model].items()):
-            plot_util_timeline(model, rate, util,
+        for rate, by_system in sorted(utils[model].items()):
+            plot_util_timeline(model, rate, by_system,
                                os.path.join(util_dir, f"{model}_rate{rate:g}.png"))
     print(f"wrote {os.path.join(out_dir, 'gpu_report.txt')} (+ .csv), "
           f"{plot_dir}/<model>_gpus_vs_rate.png, {tl_dir}/, "
-          f"{plot_dir}/<model>_mfu_mbu_vs_rate.png and {util_dir}/ (P/D only)")
+          f"{plot_dir}/<model>_mfu_mbu_vs_rate.png and {util_dir}/")
 
 
 if __name__ == "__main__":

@@ -1,138 +1,146 @@
 # Compute (MFU) and memory bandwidth (MBU) from the simulator outputs
 
-`gpu_report.py` reconstructs two utilization metrics per GPU. LLMServingSim does
-not model FLOPs or bytes: it replays profiled kernel latencies. The metrics are
-therefore rebuilt from what a run writes (`<run>.csv`, `<run>.log`) plus the
-model's dimensions.
+`gpu_report.py` computes two utilization metrics for every GPU. LLMServingSim
+does not model FLOPs or bytes: it replays profiled kernel latencies. The
+metrics are rebuilt from what each step did, plus the model's dimensions.
 
-| Metric | Definition | Computed for |
+| Metric | Definition | Limits |
 |---|---|---|
-| **MFU**, model FLOPs utilization | model FLOPs done per second ÷ peak FLOP/s | the P/D **prefill** GPU (compute-bound) |
-| **MBU**, memory bandwidth utilization | bytes read from GPU memory per second ÷ peak bandwidth | the P/D **decode** GPU (bandwidth-bound) |
+| **MFU**, model FLOPs utilization | model FLOPs done ÷ (time × peak FLOP/s) | prefill (compute-bound) |
+| **MBU**, memory bandwidth utilization | bytes read from GPU memory ÷ (time × peak bandwidth) | decode (bandwidth-bound) |
 
-## Only for disaggregated (P/D) runs
+## Source: the step log
 
-Both metrics need to know **which GPU ran which tokens**. The outputs give that
-only under disaggregation:
+`run.sh` runs the simulator with `--step-log <run>.steps.csv`, a simulator
+feature added for this purpose (see `added_features/02_step_log.md`). It
+writes one row per GPU step (one completed batch):
 
-- **Prefill GPU (instance 0):** runs every prompt token and nothing else.
-- **Decode GPU (instance 1):** generates every output token and nothing else.
-
-In a **colocated** run each GPU mixes prefill chunks and decode tokens in the
-same steps. The log's throughput lines are for the whole cluster, and the CSV
-does not say which steps a request shared with which others. The split per GPU
-cannot be recovered, so colocated runs get **no MFU/MBU**. `gpu_report.py`
-prints a warning saying so on every run.
-
-## Inputs
-
-| From | Values used |
+| Column | Used for |
 |---|---|
-| `<run>.csv`, one row per request | `input` (prompt tokens), `arrival`, `queuing_delay`, `TTFT` (ns) |
-| `<run>.log`, one tick per simulated second | generated tokens/s (whole cluster); per instance: requests running and memory used (MiB) |
-| `configs/model/<model>.json` | layers `L`, hidden size `h`, `q_dim`, `kv_dim`, intermediate size, vocabulary `V` |
-| `profiler/perf/RTXPRO6000/hardware.yaml` (or the cluster config's `npu_mem.mem_bw`, if set) | peak bandwidth: 1597.6 GB/s (RTX PRO 6000, vendor figure); the value the simulator itself uses |
-| constant `PEAK_TFLOPS` in `gpu_report.py` | 500 TFLOPS bf16 dense (datasheet: 1000 with 2:4 sparsity, halved). Not in the simulator |
+| `start_ns`, `end_ns` | the step's duration |
+| `prefill_tokens`, `decode_tokens` | real tokens: linear-layer FLOPs |
+| `attn_pairs` = Σ q·k + q(q+1)/2 | attention FLOPs (q = tokens computed this step, k = tokens already in KV) |
+| `sequences` | `lm_head` FLOPs (one row per sequence) |
+| `kv_read_tokens` = Σ k + q | KV bytes read |
+| `recompute_tokens`, `forward_tokens`, `gen_tokens` | checks and diagnostics |
 
-## MFU, prefill GPU
+**Every row belongs to one instance,** and here an instance is one GPU
+(TP=1, PP=1). So colocated and P/D runs are both covered.
 
-FLOPs of one request's whole prefill, `n` = prompt tokens:
+## Formulas
+
+Per step, with `L` layers, hidden size `h`, vocabulary `V`:
 
 ```
-FLOPs(n) = 2 · P_blocks · n          linear layers, every prompt token
-         + 2 · L · q_dim · n²        attention (QKᵀ and AV, causal: half the n×n matrix)
-         + 2 · h · V                 lm_head, last token only
+FLOPs = 2 · P_blocks · (prefill_tokens + decode_tokens)    linear layers
+      + 4 · L · q_dim · attn_pairs                         attention (QKᵀ and AV)
+      + 2 · h · V · sequences                              lm_head
+bytes = W + kv_read_tokens · 2 · L · kv_dim · 2            weights + K and V, bf16
 
 P_blocks = L · ( h·(q_dim + 2·kv_dim) + q_dim·h + 3·h·intermediate )
+W        = every weight (blocks, norms, embedding, lm_head) · 2 bytes
 ```
 
-1. **Spread each request's FLOPs** evenly over its time on the prefill GPU.
-   - It starts when the request is first scheduled: `arrival + queuing_delay`.
-   - It ends with its first token: `arrival + TTFT`.
-2. **Sum per 1-second bin:** `MFU(t) = FLOPs in second t ÷ PEAK_TFLOPS`.
-3. **Run value:** total FLOPs ÷ (busy span × peak), where the busy span runs
-   from the first request's start to the last request's first token.
+`W` matches the simulator's own weight figure (15,316.5 MiB for Llama-3.1-8B,
+62,488.8 MiB for Qwen3-32B).
 
-**Why the CSV and not the log's prompt throughput:** the log counts every
-prefill-like step in the cluster, including the decode GPU's recomputation
-after a preemption. Without preemptions the two agree exactly (llama8b, all
-rates: 852,138 tokens each). Once the decode GPU preempts, the log overcounts
-(qwen32b at 3 req/s: 1,281,012 logged vs 865,226 real prompt tokens).
+**Run values, per GPU:**
 
-## MBU, decode GPU
+| Value | = | Answers |
+|---|---|---|
+| `busy %` | Σ step time ÷ run span | how much of the time the GPU is working |
+| `mfu_busy_pct`, `mbu_busy_pct` | Σ work ÷ (Σ step time × peak) | how efficiently it works while working |
+| `mfu_wall_pct`, `mbu_wall_pct` | Σ work ÷ (run span × peak) = busy × busy % | its use over the whole run, idle time included |
 
-Each decode step reads all the weights plus the KV cache of every running
-request, and makes one token per running request:
+**Per second** (timelines): each step's work is spread over its own interval.
+Steps last 12–350 ms, so the values are close to exact.
 
-```
-steps/s(t)   = generated tokens/s(t) ÷ running(t)
-bytes/step   = W + KV(t)
-KV(t)        = decode GPU memory used(t) − W
-W            = weights = the prefill GPU's lowest memory reading (idle: weights only)
-MBU(t)       = steps/s(t) · bytes/step ÷ peak bandwidth
-```
+**Peaks:**
+- **Bandwidth:** 1597.6 GB/s, the value the simulator itself uses
+  (`profiler/perf/RTXPRO6000/hardware.yaml`).
+- **FLOP/s:** 500 TFLOPS bf16 dense (`PEAK_TFLOPS`). This is the datasheet's
+  1000 TFLOPS with 2:4 sparsity, halved; it's not in the simulator. Every MFU
+  scales with it.
 
-- **`running(t)`** is the mean of the samples at `t−1` and `t`, because the
-  token count covers that whole second.
-- **The decode GPU is the only one generating tokens**, so the cluster-wide
-  generated tokens/s belongs to it alone.
-- **Run value:** the mean of `MBU(t)` from the first to the last second with a
-  running request.
+## Checks (all 40 runs pass)
 
-**Check:** llama8b at 2 req/s has a mean token gap of 13.8 ms. Then
-(16.1 GB weights + about 2.8 GB KV) ÷ 13.8 ms ≈ 1.36 TB/s ≈ 85% of 1597.6 GB/s,
-which matches the reconstructed 86.2%.
+- **Same results:** the per-request CSVs are byte-identical with and without
+  `--step-log`.
+- **Token identity:** Σ `gen_tokens` = the run's "Total generated tokens", and
+  Σ (prefill + decode − recompute) = input + output − requests (each request's
+  first token comes from its prefill step).
+- **Timing:** no two steps of one GPU overlap.
+- **MBU against token gaps:** at llama8b P/D 2 req/s, (16.1 GB + ≈2.8 GB KV) ÷
+  13.6 ms step ≈ 1.39 TB/s ≈ 87%, against 86.5% from the log.
 
-## Limits
+## Results (RTXPRO6000, 1000 requests per run)
 
-- **1-second resolution.** The simulator does not log per-step token counts or
-  durations.
-  - Spreading FLOPs evenly and sampling `running` once per second make
-    individual seconds noisy, and a single second can exceed 100%.
-  - Read the run means: the `mfu_mean_pct` / `mbu_mean_pct` columns and
-    `plots/<model>_mfu_mbu_vs_rate.png`.
-- **The decode GPU's recomputation is not in MBU.** After a preemption it
-  recomputes prompts (compute-heavy steps that make no tokens).
-  - Its steps/s is then underestimated.
-  - This is why the overloaded qwen32b decode GPU, which preempts constantly,
-    shows about 65% MBU against 83–86% for runs that don't preempt (about 80%
-    in its own seconds without recompute, about 60% in those with).
-- **"Model FLOPs" only.** Activation traffic, norms, rotary embeddings and
-  padding are not counted, as in the standard MFU/MBU definitions.
-- **The peak FLOP/s is a datasheet figure,** not measured.
-  - If `PEAK_TFLOPS` changes, every MFU scales by the inverse ratio.
+| | MFU busy | MBU busy | Note |
+|---|---|---|---|
+| P/D prefill GPU | 61–68% (llama), 65–74% (qwen) | 12–26% | compute-bound. Busy % rises with rate, from 8% to 100% |
+| P/D decode GPU | 4–19% | 81–87% (llama); 85% → 65% (qwen) | bandwidth-bound and always busy |
+| Colocated GPU | 4% → 23% (llama), 5% → 29% (qwen) | 87% → 65% (llama), 84% → 57% (qwen) | mixes both; always busy |
+
+**Why the overloaded qwen decode GPU drops to about 65% MBU:** it preempts
+constantly, and recomputing a preempted request is prefill-like work. At
+3 req/s:
+
+| Decode GPU steps | Share of time | Mean step | MBU | MFU |
+|---|---|---|---|---|
+| plain decode | 61% | 71 ms | 78% | 14% |
+| containing recompute | 39% | 121 ms | 47% | 26% |
+
+The drop is real: the GPU spends 40% of its time on compute-heavier steps.
+
+## Fallback without a step log
+
+For a run without `<run>.steps.csv`, `gpu_report.py` reconstructs MFU and MBU
+from the per-second log and the per-request CSV, and prints a warning naming
+those runs. **This works only for P/D runs:** a colocated GPU mixes prefill and
+decode, and those outputs don't say which tokens ran where.
+
+- **Prefill GPU MFU:** each request's prefill FLOPs, spread over first-scheduled
+  → first-token (`arrival + queuing_delay` → `arrival + TTFT`), in 1-s bins.
+  Identical to the step log's wall value.
+- **Decode GPU MBU:** steps/s ≈ generated tokens/s ÷ running requests, and bytes
+  per step = W + KV in use. This undercounts by up to 7 points on llama8b P/D at
+  ≥ 10 req/s (73–75% vs 81%), and single seconds can exceed 100%.
 
 ## How reliable: scores (1 = unreasonable, 10 = matches a real GPU)
 
-Overall about **6/10**: good as run means without preemption, weak per second
-and on the overloaded runs.
+Overall about **7/10** with the step log.
 
 | Value | Score | Why |
 |---|---|---|
-| MFU, run mean | 7 | Standard FLOP formula; inputs (prompt lengths, timings) exact from the CSV. Main doubt: the 500 TFLOPS peak is the datasheet's sparse figure halved, not a stated or measured value, and every MFU scales with it |
-| MBU, run mean, no preemption | 7 | Agrees with an independent check (token gap → 85% vs 86.2%). Small approximations: KV from allocated blocks (the last block is partly empty), activations ignored |
-| MBU with preemptions (qwen32b ≥ 1.5 req/s) | 4 | Biased low by about 15–20 points: recompute steps make no tokens, so the token-based step count misses them (about 80% vs 60% in seconds without vs with recompute) |
-| Per-second values (timelines) | 3–4 | Even spreading, one `running` sample per second and 1-s bins make single seconds noisy; some exceed 100%. Good for shape, not for values |
+| MFU, run values | 7 | Exact token and attention counts per step. The main doubt is the 500 TFLOPS peak, which is not measured |
+| MBU, run values | 8 | Exact per-step bytes and durations, and they match the token-gap check |
+| Per-second values | 7 | Exact steps spread over 1-s bins |
+| Fallback (no step log) | 4–7 | MFU 7 (matches the step log); decode MBU up to 7 points low; P/D only |
 
-**Against real hardware:** the simulator's step times come from latencies
-profiled on a real RTX PRO 6000 with vLLM, so kernel efficiency is realistic.
-It leaves out CPU overheads between steps (scheduling, kernel launches), so a
-real vLLM run would likely show somewhat lower MFU/MBU. Lookups outside the
-profiled range are linear extrapolations.
+**Against real hardware:** the step durations come from latencies profiled on
+a real RTX PRO 6000 with vLLM, so kernel efficiency is realistic. Not modelled:
+CPU overheads between steps (a real vLLM run would likely show somewhat lower
+MFU/MBU) and anything outside the profiled range (extrapolated linearly).
 
-**What would raise the scores:**
-1. **A per-step log from the simulator** (tokens, recompute tokens, KV in use,
-   step duration per instance): exact steps/s, removes the preemption bias and
-   the per-second noise.
-2. **A measured peak FLOP/s** (a large bf16 GEMM benchmark on the GPU) in place
-   of the datasheet figure.
-3. **Ground truth:** a real vLLM run with DCGM counters
-   (`DCGM_FI_PROF_PIPE_TENSOR_ACTIVE`, `DCGM_FI_PROF_DRAM_ACTIVE`) to compare.
+**What would raise the scores further:**
+1. **A measured peak FLOP/s:** a large bf16 GEMM benchmark on the GPU.
+2. **Ground truth:** a real vLLM run with DCGM counters
+   (`DCGM_FI_PROF_PIPE_TENSOR_ACTIVE`, `DCGM_FI_PROF_DRAM_ACTIVE`).
+
+## Not counted
+
+- **CUDA-graph padding:** a decode batch is padded up to a capture size
+  (`forward_tokens` − real tokens; up to about a third extra rows at low load).
+  It is real GPU work but not model FLOPs, so MFU leaves it out.
+- **Activations, norms, rotary embeddings:** as in the standard definitions.
+- **`pp_size > 1`:** a step's `start→end` spans every pipeline stage, so it is
+  not one GPU's busy time. The experiments use TP=1 and PP=1.
 
 ## Outputs, under the experiment's output folder (`outputs/pd_ttft_long/`)
 
-- `gpu_report.csv`: `mfu_mean_pct` on P/D prefill rows, `mbu_mean_pct` on P/D
-  decode rows, empty elsewhere.
-- `gpu_report.txt`: the same, as the `MFU %` / `MBU %` columns.
-- `plots/<model>_mfu_mbu_vs_rate.png`: run means vs request rate.
-- `plots/mfu_mbu_timelines/<model>_rate<R>.png`: per-second MFU and MBU.
+- `gpu_report.csv` / `.txt`: `busy_pct`, `step_ms_mean`, `mfu_busy_pct`,
+  `mfu_wall_pct`, `mbu_busy_pct`, `mbu_wall_pct`, and `util_source`
+  (`step_log` or `reconstructed`).
+- `plots/<model>_mfu_mbu_vs_rate.png`: busy (solid) and wall (dashed) values vs
+  rate.
+- `plots/mfu_mbu_timelines/<model>_rate<R>.png`: per-second MFU and MBU per GPU.
