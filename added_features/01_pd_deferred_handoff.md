@@ -48,7 +48,8 @@ overtake a large one forever, and the large one would never be admitted.
   first token (made on the prefill GPU) and the second (decode GPU), and as
   waiting requests on the decode instance.
 
-Deferred handoffs in the `experiments/pd_ttft` sweep (1000 requests per run).
+Deferred handoffs in the `experiments/pd_ttft` sweep (1000 requests per run;
+that experiment has since been removed).
 Every non-zero row would have crashed without this change:
 
 | Model | Rates with deferrals | Deferred handoffs |
@@ -62,7 +63,7 @@ Every non-zero row would have crashed without this change:
   their baselines, and all 10 `bench/examples` outputs are byte-identical. No
   existing scenario fills a decode KV cache, so none of them changed.
 - The 40-run `experiments/pd_ttft` sweep and the 15-run `experiments/pd_kv_sweep`
-  complete with no failures.
+  (both since removed) complete with no failures.
 
 ## Limits
 

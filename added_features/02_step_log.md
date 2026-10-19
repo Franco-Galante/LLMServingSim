@@ -9,9 +9,8 @@
 
 ## Why
 
-`experiments/pd_ttft/gpu_report.py` reconstructs MFU and MBU from 1-second log
-lines (see `experiments/pd_ttft/assets/compute_and_memory.md`). That
-reconstruction:
+`experiments/pd_ttft/gpu_report.py` (since removed) reconstructed MFU and MBU
+from 1-second log lines. That reconstruction:
 
 - **works only for P/D runs:** colocated GPUs mix prefill and decode, and the
   log cannot split them;
@@ -50,7 +49,8 @@ and how long it took.
 | `kv_used_bytes` | `batch.kv_size` | memory check |
 | `gen_tokens` | tokens produced by the step | throughput check |
 
-Per step, `gpu_report.py` will then compute (FLOP terms as in `compute_and_memory.md`):
+Per step, the experiments' report scripts compute (FLOP terms as in
+`experiments/docs/compute_and_memory.md`):
 
 ```
 MFU = (2·P_blocks·tokens + 4·L·q_dim·attn_pairs + 2·h·V·sequences) ÷ (duration · TP · peak FLOP/s)
@@ -60,7 +60,6 @@ MBU = (weights + kv_read_tokens · KV bytes/token) ÷ (duration · peak bandwidt
 - **Run values** come in two forms: **busy** (Σ work ÷ Σ step time) and
   **wall** (Σ work ÷ run span, including idle time).
 - **Colocated runs are covered too,** since every row belongs to one instance.
-- **Runs without a step log** fall back to the per-second reconstruction.
 
 ## Parallel runs: no race conditions
 
@@ -77,7 +76,7 @@ MBU = (weights + kv_read_tokens · KV bytes/token) ÷ (duration · peak bandwidt
 
 1. **Flag off:** the full `./serving/validate.sh` passes: 70/70 scenarios and
    all 10 `bench/examples` outputs byte-identical.
-2. **Flag on:** in the 40-run `experiments/pd_ttft` sweep, every per-request CSV
+2. **Flag on:** in the 40-run `experiments/pd_ttft` sweep (since removed), every per-request CSV
    is byte-identical to the run without it.
 3. **Consistency, all 40 runs:**
    - Σ `gen_tokens` = "Total generated tokens";

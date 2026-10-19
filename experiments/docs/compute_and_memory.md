@@ -1,8 +1,9 @@
 # Compute (MFU) and memory bandwidth (MBU) from the simulator outputs
 
-`gpu_report.py` computes two utilization metrics for every GPU. LLMServingSim
-does not model FLOPs or bytes: it replays profiled kernel latencies. The
-metrics are rebuilt from what each step did, plus the model's dimensions.
+The experiments' report scripts (`experiments/pd_balance/report.py`) compute
+two utilization metrics for every GPU. LLMServingSim does not model FLOPs or
+bytes: it replays profiled kernel latencies. The metrics are rebuilt from what
+each step did, plus the model's dimensions.
 
 | Metric | Definition | Limits |
 |---|---|---|
@@ -11,9 +12,9 @@ metrics are rebuilt from what each step did, plus the model's dimensions.
 
 ## Source: the step log
 
-`run.sh` runs the simulator with `--step-log <run>.steps.csv`, a simulator
-feature added for this purpose (see `added_features/02_step_log.md`). It
-writes one row per GPU step (one completed batch):
+The experiment's `run.sh` runs the simulator with `--step-log <run>.steps.csv`
+(see `added_features/02_step_log.md`). It writes one row per GPU step (one
+completed batch):
 
 | Column | Used for |
 |---|---|
@@ -44,13 +45,19 @@ W        = every weight (blocks, norms, embedding, lm_head) · 2 bytes
 `W` matches the simulator's own weight figure (15,316.5 MiB for Llama-3.1-8B,
 62,488.8 MiB for Qwen3-32B).
 
-**Run values, per GPU:**
+**Run values, per GPU,** over the experiment's measurement window (in
+`pd_balance`, the steady-state window 120-600 s; a step cut by the window's
+edges counts pro rata):
 
 | Value | = | Answers |
 |---|---|---|
-| `busy %` | Σ step time ÷ run span | how much of the time the GPU is working |
+| `busy %` | Σ step time ÷ window length | how much of the time the GPU is working |
 | `mfu_busy_pct`, `mbu_busy_pct` | Σ work ÷ (Σ step time × peak) | how efficiently it works while working |
-| `mfu_wall_pct`, `mbu_wall_pct` | Σ work ÷ (run span × peak) = busy × busy % | its use over the whole run, idle time included |
+| `mfu_wall_pct`, `mbu_wall_pct` | Σ work ÷ (window length × peak) = busy × busy % | its use over the whole window, idle time included |
+
+A prefill GPU's "while busy" MFU is high (about 65%) even at low load, because
+every prefill step is a large matrix multiply; load changes its busy %, and so
+its wall value.
 
 **Per second** (timelines): each step's work is spread over its own interval.
 Steps last 12–350 ms, so the values are close to exact.
@@ -62,7 +69,10 @@ Steps last 12–350 ms, so the values are close to exact.
   1000 TFLOPS with 2:4 sparsity, halved; it's not in the simulator. Every MFU
   scales with it.
 
-## Checks (all 40 runs pass)
+## Checks
+
+Done when the step log was introduced, on 40 runs of an earlier sweep
+(Llama-3.1-8B and Qwen3-32B, P/D and colocated):
 
 - **Same results:** the per-request CSVs are byte-identical with and without
   `--step-log`.
@@ -70,52 +80,31 @@ Steps last 12–350 ms, so the values are close to exact.
   Σ (prefill + decode − recompute) = input + output − requests (each request's
   first token comes from its prefill step).
 - **Timing:** no two steps of one GPU overlap.
-- **MBU against token gaps:** at llama8b P/D 2 req/s, (16.1 GB + ≈2.8 GB KV) ÷
-  13.6 ms step ≈ 1.39 TB/s ≈ 87%, against 86.5% from the log.
+- **MBU against token gaps:** at Llama-3.1-8B P/D 2 req/s, (16.1 GB + ≈2.8 GB
+  KV) ÷ 13.6 ms step ≈ 1.39 TB/s ≈ 87%, against 86.5% from the step log.
 
-## Results (RTXPRO6000, 1000 requests per run)
+## Why a preempting decode GPU shows lower MBU
 
-| | MFU busy | MBU busy | Note |
-|---|---|---|---|
-| P/D prefill GPU | 61–68% (llama), 65–74% (qwen) | 12–26% | compute-bound. Busy % rises with rate, from 8% to 100% |
-| P/D decode GPU | 4–19% | 81–87% (llama); 85% → 65% (qwen) | bandwidth-bound and always busy |
-| Colocated GPU | 4% → 23% (llama), 5% → 29% (qwen) | 87% → 65% (llama), 84% → 57% (qwen) | mixes both; always busy |
-
-**Why the overloaded qwen decode GPU drops to about 65% MBU:** it preempts
-constantly, and recomputing a preempted request is prefill-like work. At
-3 req/s:
+Recomputing a preempted request is prefill-like work on the decode GPU, so
+steps that contain recompute are more compute-heavy and read relatively fewer
+bytes per second. On an overloaded Qwen3-32B decode GPU (1P+1D at 3 req/s):
 
 | Decode GPU steps | Share of time | Mean step | MBU | MFU |
 |---|---|---|---|---|
 | plain decode | 61% | 71 ms | 78% | 14% |
 | containing recompute | 39% | 121 ms | 47% | 26% |
 
-The drop is real: the GPU spends 40% of its time on compute-heavier steps.
-
-## Fallback without a step log
-
-For a run without `<run>.steps.csv`, `gpu_report.py` reconstructs MFU and MBU
-from the per-second log and the per-request CSV, and prints a warning naming
-those runs. **This works only for P/D runs:** a colocated GPU mixes prefill and
-decode, and those outputs don't say which tokens ran where.
-
-- **Prefill GPU MFU:** each request's prefill FLOPs, spread over first-scheduled
-  → first-token (`arrival + queuing_delay` → `arrival + TTFT`), in 1-s bins.
-  Identical to the step log's wall value.
-- **Decode GPU MBU:** steps/s ≈ generated tokens/s ÷ running requests, and bytes
-  per step = W + KV in use. This undercounts by up to 7 points on llama8b P/D at
-  ≥ 10 req/s (73–75% vs 81%), and single seconds can exceed 100%.
+The drop in MBU under overload is real, not an artifact of the calculation.
 
 ## How reliable: scores (1 = unreasonable, 10 = matches a real GPU)
 
-Overall about **7/10** with the step log.
+Overall about **7/10**.
 
 | Value | Score | Why |
 |---|---|---|
 | MFU, run values | 7 | Exact token and attention counts per step. The main doubt is the 500 TFLOPS peak, which is not measured |
 | MBU, run values | 8 | Exact per-step bytes and durations, and they match the token-gap check |
 | Per-second values | 7 | Exact steps spread over 1-s bins |
-| Fallback (no step log) | 4–7 | MFU 7 (matches the step log); decode MBU up to 7 points low; P/D only |
 
 **Against real hardware:** the step durations come from latencies profiled on
 a real RTX PRO 6000 with vLLM, so kernel efficiency is realistic. Not modelled:
@@ -136,11 +125,10 @@ MFU/MBU) and anything outside the profiled range (extrapolated linearly).
 - **`pp_size > 1`:** a step's `start→end` spans every pipeline stage, so it is
   not one GPU's busy time. The experiments use TP=1 and PP=1.
 
-## Outputs, under the experiment's output folder (`outputs/pd_ttft_long/`)
+## Outputs (`pd_balance`, under `outputs/pd_balance/`)
 
-- `gpu_report.csv` / `.txt`: `busy_pct`, `step_ms_mean`, `mfu_busy_pct`,
-  `mfu_wall_pct`, `mbu_busy_pct`, `mbu_wall_pct`, and `util_source`
-  (`step_log` or `reconstructed`).
-- `plots/<model>_mfu_mbu_vs_rate.png`: busy (solid) and wall (dashed) values vs
-  rate.
-- `plots/mfu_mbu_timelines/<model>_rate<R>.png`: per-second MFU and MBU per GPU.
+- `gpu_report.csv` / `.txt`: per GPU and rate, `busy_pct`, `step_ms_mean`,
+  `mfu_busy_pct`, `mfu_wall_pct`, `mbu_busy_pct`, `mbu_wall_pct`, plus running,
+  waiting and memory.
+- `plots/G<G>_*/gpu_load.png`: busy %, MFU and MBU while busy per GPU role vs rate.
+- `plots/G<G>_*/timelines/<layout>_rate<R>.png`: per-second MFU and MBU per GPU.
